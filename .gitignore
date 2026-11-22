@@ -6,3 +6,5 @@ examples/*/bin/
 examples/*/obj/
 src/csharp/bin/
 src/csharp/obj/
+config.bat
+node_modules

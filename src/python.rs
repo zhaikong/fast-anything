@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const RUNNER: &str = include_str!("python/runner.py");
+const HOOK: &str = include_str!("python/sitecustomize.py");
 const PYO3: &str = "0.30";
 /// rust-numpy, for NDArray parameters and results; its versions follow PyO3's.
 const NUMPY: &str = "0.30";
@@ -85,23 +86,45 @@ fn helper(ctx: &Ctx, python: &str, mode: &str, job: Value, app_args: &[String]) 
     fs::write(&runner, RUNNER)?;
     let job_path = ctx.fast.join(format!("job-{mode}.json"));
     fs::write(&job_path, serde_json::to_vec_pretty(&job)?)?;
-    let out = output(
-        Command::new(python)
-            .arg(&runner)
-            .arg(mode)
-            .arg(&job_path)
-            .arg("--")
-            .args(app_args)
-            .current_dir(&ctx.root)
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("PYTHONUTF8", "1")
-            .stdin(Stdio::null()),
-        "python",
-    )?;
+    let mut cmd = Command::new(python);
+    cmd.arg(&runner)
+        .arg(mode)
+        .arg(&job_path)
+        .arg("--")
+        .args(app_args)
+        .current_dir(&ctx.root)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .stdin(Stdio::null());
+    if mode != "verify" {
+        watch_workers(ctx, &mut cmd, &runner, &job_path, mode)?;
+    }
+    let out = output(&mut cmd, "python")?;
     if !out.status.success() {
         bail!("the python {mode} run failed ({}):\n{}", out.status, tail(&combined(&out), 30));
     }
     Ok(out)
+}
+
+/// Let the app's multiprocessing workers profile or record too: a sitecustomize first on PYTHONPATH
+/// wraps each worker (see python/sitecustomize.py), which leaves its results in .fast/children.
+fn watch_workers(ctx: &Ctx, cmd: &mut Command, runner: &Path, job: &Path, mode: &str) -> Result<()> {
+    let hook = ctx.fast.join("hook");
+    fs::create_dir_all(&hook)?;
+    fs::write(hook.join("sitecustomize.py"), HOOK)?;
+    let children = ctx.fast.join("children");
+    let _ = fs::remove_dir_all(&children);
+    fs::create_dir_all(&children)?;
+    let mut paths = vec![hook];
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    cmd.env("PYTHONPATH", std::env::join_paths(paths)?)
+        .env("FAST_ANYTHING_CHILDREN", &children)
+        .env("FAST_ANYTHING_RUNNER", runner)
+        .env("FAST_ANYTHING_JOB", job)
+        .env("FAST_ANYTHING_MODE", mode);
+    Ok(())
 }
 
 pub fn profile(ctx: &Ctx, python: &str, app_args: &[String]) -> Result<Profile> {
@@ -1128,5 +1151,71 @@ mod tests {
         assert!(is_python("C:\\Python313\\python.exe"));
         assert!(is_python("py"));
         assert!(!is_python("node"));
+    }
+
+    #[test]
+    fn workers_are_profiled_and_recorded() {
+        let Some(python) = ["python3", "python"]
+            .into_iter()
+            .find(|p| Command::new(p).arg("--version").output().is_ok_and(|o| o.status.success()))
+        else {
+            eprintln!("no python on PATH, skipping");
+            return;
+        };
+        // macOS's temp folder is a symlink and Python reports the files' real paths; on Windows,
+        // canonicalize() would give a \\?\ path Python doesn't use
+        let tmp = std::env::temp_dir();
+        let tmp = if cfg!(windows) { tmp } else { tmp.canonicalize().unwrap() };
+        let dir = tmp.join(format!("fa-workers-test-{}", std::process::id()));
+        let (hook, children) = (dir.join("hook"), dir.join("children"));
+        fs::create_dir_all(&hook).unwrap();
+        fs::create_dir_all(&children).unwrap();
+        fs::write(hook.join("sitecustomize.py"), HOOK).unwrap();
+        fs::write(dir.join("runner.py"), RUNNER).unwrap();
+        fs::write(dir.join("work.py"), "def sq(x: int) -> int:\n    return x * x\n").unwrap();
+        fs::write(
+            dir.join("app.py"),
+            "from concurrent.futures import ProcessPoolExecutor\nfrom multiprocessing import get_context\n\
+             from work import sq\n\nif __name__ == \"__main__\":\n\
+             \x20   with ProcessPoolExecutor(2, mp_context=get_context(\"spawn\")) as pool:\n\
+             \x20       print(sum(pool.map(sq, range(20))))\n",
+        )
+        .unwrap();
+        let run = |mode: &str, job: Value| {
+            let job_path = dir.join(format!("job-{mode}.json"));
+            fs::write(&job_path, job.to_string()).unwrap();
+            let _ = fs::remove_dir_all(&children);
+            fs::create_dir_all(&children).unwrap();
+            let out = Command::new(python)
+                .args([
+                    dir.join("runner.py").as_os_str(),
+                    mode.as_ref(),
+                    job_path.as_os_str(),
+                    "--".as_ref(),
+                    "app.py".as_ref(),
+                ])
+                .current_dir(&dir)
+                .env("PYTHONPATH", &hook)
+                .env("FAST_ANYTHING_CHILDREN", &children)
+                .env("FAST_ANYTHING_RUNNER", dir.join("runner.py"))
+                .env("FAST_ANYTHING_JOB", &job_path)
+                .env("FAST_ANYTHING_MODE", mode)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        run("profile", json!({ "root": dir, "out": dir.join("profile.json"), "max": 40 }));
+        let profile: Value = serde_json::from_str(&fs::read_to_string(dir.join("profile.json")).unwrap()).unwrap();
+        let sq = profile["functions"].as_array().unwrap().iter().find(|f| f["name"] == "sq").cloned();
+        run(
+            "record",
+            json!({ "module": "work", "func": "sq", "owner": null, "limit": 500,
+                               "out": dir.join("rec.jsonl"), "meta": dir.join("rec.meta.json") }),
+        );
+        let meta: Value = serde_json::from_str(&fs::read_to_string(dir.join("rec.meta.json")).unwrap()).unwrap();
+        let recorded = fs::read_to_string(dir.join("rec.jsonl")).unwrap().lines().count();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(sq.map(|f| f["ncalls"].clone()), Some(json!(20)), "sq ran 20 times in the workers");
+        assert_eq!((meta["calls"].clone(), recorded), (json!(20), 20));
     }
 }

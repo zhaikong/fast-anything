@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const GITIGNORE: &str = "# fast-anything: commit ports/*/src and Cargo.toml (your Rust ports); skip the rest\n\
-target/\nlib/\nbin/\nbackup/\nrunner.*\nrecorder.*\nDescribe.java\n*.txt\njob-*.json\nprofile.*\n*.pprof\nverify.json\n*.jsonl\n*.meta.json\n*.log\n";
+target/\nlib/\nbin/\nbackup/\nhook/\nchildren/\nrunner.*\nrecorder.*\nDescribe.java\n*.txt\njob-*.json\nprofile.*\n*.pprof\nverify.json\n*.jsonl\n*.meta.json\n*.log\n";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
